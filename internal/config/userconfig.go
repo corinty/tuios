@@ -365,6 +365,7 @@ type AppearanceConfig struct {
 	PreferredShell           string                  `toml:"preferred_shell"`              // Preferred shell: if empty, auto-detect based on platform.
 	AnimationsEnabled        *bool                   `toml:"animations_enabled,omitempty"` // Deprecated: folded into motion on load (false is none)
 	Motion                   string                  `toml:"motion"`                       // How much moves: none, basic (window slides, copy sweep), full (also fades and the working shimmer) (default: full)
+	Calm                     *bool                   `toml:"calm"`                         // Calm mode: no motion or blinking, and only messages that need you reach the dock (default: false)
 	ModalDim                 *int                    `toml:"modal_dim"`                    // Percent the screen behind a modal overlay is darkened; 0 is off (default: 30)
 	PopupDim                 *int                    `toml:"popup_dim"`                    // Percent the screen behind a popup is darkened; 0 is off (default: 0)
 	ConfirmQuit              *bool                   `toml:"confirm_quit"`                 // Always show quit confirmation dialog (default: false). When false, only shown if foreground processes are running.
@@ -1390,6 +1391,10 @@ func DefaultConfig() *UserConfig {
 				// g shows or hides the scratch terminal in a popup. It was
 				// free here, and f is kept free for the reason above.
 				"toggle_scratch": {"g"},
+				// Z for calm (zen): no motion, no blinking, and only the
+				// messages that need you. z zooms, and the slip from Z to z
+				// costs nothing.
+				"toggle_calm": {"Z"},
 				// V pastes the clipboard's image into the pane as the path of a
 				// file on the pane's machine. Capital, one shift from the v
 				// that reviews.
@@ -2881,6 +2886,7 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	if s.NoAnimationsFlag {
 		s.Motion = MotionNone
 	}
+	s.Calm = a.Calm != nil && *a.Calm
 	if a.ModalDim != nil {
 		s.ModalDim = min(max(*a.ModalDim, 0), ModalDimMax)
 	}
@@ -3644,6 +3650,8 @@ func fillMissingKeybinds(cfg, defaultCfg *UserConfig) {
 var yieldingDefaults = map[string]bool{
 	"hints":          true,
 	"toggle_scratch": true,
+	// Z after the prefix, new with calm mode.
+	"toggle_calm": true,
 	// Q after the prefix, new in the release after v0.8.5.
 	"display_panes": true,
 	// U in window mode, new with the keybind presets.

@@ -852,6 +852,7 @@ var ActionDescriptions = map[string]string{
 	"hints":           "Label the text on the pane to copy it",
 	"display_panes":   "Label the panes and focus one by its label",
 	"toggle_scratch":  "Show or hide the scratch terminal",
+	"toggle_calm":     "Calm mode",
 	"hints_all_panes": "Label the text on all panes to copy it",
 
 	// The scrollback in the editor (prefix E, ctrl+g in copy mode)
