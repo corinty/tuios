@@ -9822,3 +9822,13 @@ on Linux.
 | --- | --- | --- |
 | The dock notice in `adoptNotes` | the dock never shows "Note: next: run the migration" on attach | **caught** |
 | Pane notes collected after `UpdateState` in the restore, which rewrites the restored windows in place (the first draft of the change) | after a daemon restart `note get -w worker` prints nothing | **caught** |
+
+## Path picker
+
+`TestPathPickerTypesAPath` opens the picker with `alt+;` at a shell prompt,
+filters, walks into a folder with `Tab`, and types a file name with a space
+with `Enter`. The shell then reads the file. Run on 2026-10-27 on Linux.
+
+| Control: what was cut | Where it fails | Verdict |
+| --- | --- | --- |
+| `PathPickerAccept` returns before `w.Paste` | the wait for `cat 'zulu/release notes.md'` on the shell line times out | **caught** |
