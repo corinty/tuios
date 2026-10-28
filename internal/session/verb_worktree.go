@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/gitstate"
 	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
@@ -147,16 +148,10 @@ func repoRootParam(dir string) (string, *verbError) {
 // it away because a session failed to start would be removing something the
 // caller asked for and can still use. The session gets the caller's terminal
 // from its hello, as one made by new-session does.
-func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
-	path := worktree.PathFor(worktree.DefaultDir(), root, branch)
-	if _, err := os.Lstat(path); err == nil {
-		return nil, hintedVerbError(ErrVerbGitFailed, path+" already exists", &VerbHint{
-			Param:  "branch",
-			Detail: "A worktree for this branch is already there. Attach to its session, or remove it with remove-worktree first.",
-		})
-	}
+func (d *Daemon) createWorktreeSession(cs *connState, root, anchor, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
+	repoName := gitstate.RepoName(root)
 	if sessionName == "" {
-		sessionName = worktree.SessionName(filepath.Base(root), branch)
+		sessionName = worktree.SessionName(repoName, branch)
 	}
 	if err := ValidateSessionName(sessionName); err != nil {
 		return nil, invalidParam("name", err.Error())
@@ -170,12 +165,44 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
 		})
 	}
 
-	created, err := worktree.Add(root, path, branch, base)
-	if err != nil {
-		return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
-			Param:  "branch",
-			Detail: "git refused to add the worktree. The repository is as it was.",
-		})
+	var path string
+	var created bool
+	if provider := worktree.ActiveProvider(); provider != nil {
+		cmdAnchor := worktree.FindAnchor(anchor)
+		if cmdAnchor == "" {
+			cmdAnchor = worktree.FindAnchor(root)
+		}
+		if handled, err := provider.Handles(cmdAnchor); err != nil {
+			return nil, hintedVerbError(ErrVerbGitFailed, "worktree provider error: "+err.Error(), nil)
+		} else if handled {
+			createdPath, err := provider.Create(cmdAnchor, branch, base)
+			if err != nil {
+				return nil, hintedVerbError(ErrVerbGitFailed, "worktree provider refused: "+err.Error(), &VerbHint{
+					Param:  "branch",
+					Detail: "The worktree provider could not create the worktree.",
+				})
+			}
+			path = createdPath
+			created = true
+		}
+	}
+
+	if path == "" {
+		path = worktree.PathFor(worktree.DefaultDir(), root, branch)
+		if _, err := os.Lstat(path); err == nil {
+			return nil, hintedVerbError(ErrVerbGitFailed, path+" already exists", &VerbHint{
+				Param:  "branch",
+				Detail: "A worktree for this branch is already there. Attach to its session, or remove it with remove-worktree first.",
+			})
+		}
+		var err error
+		created, err = worktree.Add(root, path, branch, base)
+		if err != nil {
+			return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+				Param:  "branch",
+				Detail: "git refused to add the worktree. The repository is as it was.",
+			})
+		}
 	}
 
 	sess, err := d.manager.CreateSession(sessionName, callerSessionConfig(cs), defaultVerbSessionWidth, defaultVerbSessionHeight)
@@ -186,7 +213,7 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
 	}
 	info := &WorktreeInfo{
 		Info: worktree.Info{
-			Repo:     filepath.Base(root),
+			Repo:     repoName,
 			RepoRoot: root,
 			Branch:   branch,
 			Path:     path,
@@ -256,7 +283,15 @@ func (d *Daemon) verbNewWorktree(cs *connState, params json.RawMessage) (any, *v
 	if verr != nil {
 		return nil, verr
 	}
-	out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
+	anchor := strings.TrimSpace(p.repoSource.Repo)
+	if anchor != "" {
+		if abs, err := filepath.Abs(anchor); err == nil {
+			anchor = abs
+		}
+	} else {
+		anchor = root
+	}
+	out, verr := d.createWorktreeSession(cs, root, anchor, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
 	if verr != nil {
 		return nil, verr
 	}
@@ -735,9 +770,17 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	}
 
 	sessions := make([]map[string]any, 0, p.Count)
+	anchor := strings.TrimSpace(p.repoSource.Repo)
+	if anchor != "" {
+		if abs, err := filepath.Abs(anchor); err == nil {
+			anchor = abs
+		}
+	} else {
+		anchor = root
+	}
 	for i, branch := range branches {
 		launch, prompt := launches[i%len(launches)], promptFor(i)
-		out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
+		out, verr := d.createWorktreeSession(cs, root, anchor, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
 			info.Group = stem
 			info.FanID = fanID
 			info.LaunchedFrom = launchedFrom

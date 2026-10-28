@@ -46,6 +46,7 @@ What changed in v0.10.1 is in the [release notes](docs/release-notes/v0.10.1.md)
 - **[tmux Shim](docs/TMUX_SHIM.md)**: Run tools that drive tmux, such as Claude Code agent teams
 - **[Control Protocol](docs/protocol.md)**: JSON verb protocol for driving the daemon
 - **[Architecture](docs/ARCHITECTURE.md)**: Technical design
+- **[Local Patches](patches/README.md)**: Fork-local patches for external worktree provider integration
 
 <details>
 <summary>Table of Contents</summary>
@@ -56,6 +57,7 @@ What changed in v0.10.1 is in the [release notes](docs/release-notes/v0.10.1.md)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
 - [Performance](#performance)
+- [Local Patches](#local-patches-fork)
 - [Development](#development)
 - [Contributors](#contributors)
 - [License](#license)
@@ -343,6 +345,14 @@ TUIOS follows the Model-View-Update pattern on Bubble Tea v2. For details, see [
 - **Style caching**: LRU cache with sequence-based change detection (40-60% allocation reduction).
 - **Viewport culling**: Off-screen and minimized panes skip rendering.
 - **Memory pooling**: Pooled strings, buffers, and styles.
+
+## Local Patches (Fork)
+
+This fork tracks custom patches over upstream [`Gaurav-Gosain/tuios`](https://github.com/Gaurav-Gosain/tuios) in [`patches/`](./patches/):
+
+- **External Worktree Provider (`0001-worktree-external-provider-command.patch`)**: Allows external tooling (such as monorepo sparse-checkout workspace managers) to manage worktree creation, listing, and removal with fallback to native `git worktree`. Matches Herdr's external provider JSON contract.
+
+See [`patches/README.md`](./patches/README.md) for documentation on how to apply, re-roll, and maintain them.
 
 ## Development
 

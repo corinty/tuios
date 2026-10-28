@@ -393,11 +393,25 @@ func Stash(path, message string) error {
 	return err
 }
 
-// Remove takes a worktree away with "git worktree remove". Without force git
-// refuses a worktree holding uncommitted changes, and so does this. The
+// Remove takes a worktree away with "git worktree remove", or with the external
+// worktree provider when one is configured and manages the worktree. Without force
+// git refuses a worktree holding uncommitted changes, and so does this. The
 // branch is never touched: it stays in the repository with every commit the
 // worktree made.
 func Remove(repoRoot, path string, force bool) error {
+	if p := ActiveProvider(); p != nil {
+		if handled, err := p.Handles(path); err != nil {
+			return err
+		} else if handled {
+			return p.Remove(path, force)
+		}
+		anchor := FindAnchor(repoRoot)
+		if handled, err := p.Handles(anchor); err != nil {
+			return err
+		} else if handled {
+			return p.Remove(path, force)
+		}
+	}
 	args := []string{"worktree", "remove"}
 	if force {
 		args = append(args, "--force")
@@ -485,8 +499,17 @@ type Entry struct {
 }
 
 // List returns every checkout of the repository dir is in, the main one
-// first, as git worktree list --porcelain reports them.
+// first, as git worktree list --porcelain reports them, or as the external
+// worktree provider reports them when one manages this repository.
 func List(dir string) ([]Entry, error) {
+	if p := ActiveProvider(); p != nil {
+		anchor := FindAnchor(dir)
+		if handled, err := p.Handles(anchor); err != nil {
+			return nil, err
+		} else if handled {
+			return p.List(anchor)
+		}
+	}
 	out, err := run(dir, "worktree", "list", "--porcelain")
 	if err != nil {
 		return nil, err

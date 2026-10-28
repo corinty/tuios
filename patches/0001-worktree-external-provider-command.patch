@@ -1,0 +1,791 @@
+From 7773b3ae2ceb1345953becf53d9ccfe96cd7b52d Mon Sep 17 00:00:00 2001
+From: Corin McHargue <corin.mchargue@gmail.com>
+Date: Wed, 28 Oct 2026 16:05:38 -0500
+Subject: [PATCH] feat(worktree): allow an external provider command to manage
+ worktrees
+
+Add worktrees.provider_command and TUIOS_WORKTREES_PROVIDER_COMMAND.
+When set (or when HERDR_WORKTREES_PROVIDER_COMMAND is in the environment),
+tuios delegates worktree creation, listing, and removal to the external
+provider through the JSON-RPC contract (detect, resolve, create, list,
+remove).
+
+Repositories not claimed by the provider fall back to native git worktrees.
+---
+ internal/config/userconfig.go          |   3 +
+ internal/config/worktrees.go           |  12 ++
+ internal/session/daemon_hosts.go       |   4 +
+ internal/session/daemon_user_config.go |   4 +
+ internal/session/verb_worktree.go      |  79 +++++++---
+ internal/session/verb_worktree_test.go |  86 +++++++++++
+ internal/worktree/provider.go          | 200 +++++++++++++++++++++++++
+ internal/worktree/provider_test.go     | 189 +++++++++++++++++++++++
+ internal/worktree/worktree.go          |  29 +++-
+ 9 files changed, 585 insertions(+), 21 deletions(-)
+ create mode 100644 internal/config/worktrees.go
+ create mode 100644 internal/worktree/provider.go
+ create mode 100644 internal/worktree/provider_test.go
+
+diff --git a/internal/config/userconfig.go b/internal/config/userconfig.go
+index 11321e23..fb857f94 100644
+--- a/internal/config/userconfig.go
++++ b/internal/config/userconfig.go
+@@ -68,6 +68,9 @@ type UserConfig struct {
+ 	// Workspaces is the [workspaces] table: what happens when the workspace
+ 	// on screen loses its last pane. See workspaces.go.
+ 	Workspaces WorkspacesConfig `toml:"workspaces"`
++	// Worktrees is the [worktrees] table: directory and external provider command.
++	// See worktrees.go.
++	Worktrees WorktreesConfig `toml:"worktrees"`
+ 
+ 	// PasteBuffers is the [paste_buffers] table: how many yanks tuios keeps
+ 	// to paste again. See paste_buffers.go.
+diff --git a/internal/config/worktrees.go b/internal/config/worktrees.go
+new file mode 100644
+index 00000000..6532c316
+--- /dev/null
++++ b/internal/config/worktrees.go
+@@ -0,0 +1,12 @@
++package config
++
++// WorktreesConfig is the [worktrees] section of config.toml.
++type WorktreesConfig struct {
++	// Directory is the root under which tuios puts worktrees it creates.
++	// Empty means default ($XDG_DATA_HOME/tuios/worktrees or TUIOS_WORKTREE_DIR).
++	Directory string `toml:"directory"`
++	// ProviderCommand is an optional external program that manages worktrees
++	// instead of native git. When set, tuios delegates create/list/remove to it
++	// using the external provider JSON contract.
++	ProviderCommand string `toml:"provider_command"`
++}
+diff --git a/internal/session/daemon_hosts.go b/internal/session/daemon_hosts.go
+index 0c219c7b..eb43a8ec 100644
+--- a/internal/session/daemon_hosts.go
++++ b/internal/session/daemon_hosts.go
+@@ -12,6 +12,7 @@ import (
+ 
+ 	"github.com/Gaurav-Gosain/tuios/internal/config"
+ 	"github.com/Gaurav-Gosain/tuios/internal/federation"
++	"github.com/Gaurav-Gosain/tuios/internal/worktree"
+ )
+ 
+ // Hot reload for the [hosts] table.
+@@ -121,6 +122,9 @@ func (d *Daemon) applyUserConfig(cfg *config.UserConfig, byPerson bool) {
+ 	d.manager.SetPreferredShell(cfg.Appearance.PreferredShell)
+ 	d.manager.SetHerdrProtocol(cfg.Agents.HerdrProtocol)
+ 	d.manager.SetReturnWhenEmpty(cfg.Workspaces.ReturnsWhenEmpty())
++	if cfg.Worktrees.ProviderCommand != "" {
++		worktree.SetProviderCommand(cfg.Worktrees.ProviderCommand)
++	}
+ 	if d.buffers != nil {
+ 		d.buffers.SetLimits(cfg.PasteBuffers.Resolved())
+ 	}
+diff --git a/internal/session/daemon_user_config.go b/internal/session/daemon_user_config.go
+index 92e9936e..8cbbab14 100644
+--- a/internal/session/daemon_user_config.go
++++ b/internal/session/daemon_user_config.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/Gaurav-Gosain/tuios/internal/config"
+ 	"github.com/Gaurav-Gosain/tuios/internal/federation"
++	"github.com/Gaurav-Gosain/tuios/internal/worktree"
+ )
+ 
+ // DaemonConfigFromUser maps the parts of the user's config file the daemon
+@@ -48,6 +49,9 @@ func DaemonConfigFromUser(uc *config.UserConfig) *DaemonConfig {
+ 	cfg.SingleClient = uc.Daemon.SingleClient
+ 	cfg.SSHAgent = uc.Daemon.SSHAgent
+ 	cfg.Display = uc.Daemon.Display
++	if uc.Worktrees.ProviderCommand != "" {
++		worktree.SetProviderCommand(uc.Worktrees.ProviderCommand)
++	}
+ 	cfg.History = ResolveHistoryPolicy(uc.Daemon.PersistScrollback, uc.Daemon.PersistScrollbackLines, uc.Daemon.PersistScrollbackKB)
+ 	cfg.Hosts = HostsFromConfig(uc)
+ 	// The same table says what each machine linked to this one may do here.
+diff --git a/internal/session/verb_worktree.go b/internal/session/verb_worktree.go
+index 60e2d161..d2be58b7 100644
+--- a/internal/session/verb_worktree.go
++++ b/internal/session/verb_worktree.go
+@@ -16,6 +16,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/Gaurav-Gosain/tuios/internal/gitstate"
+ 	"github.com/Gaurav-Gosain/tuios/internal/plural"
+ 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
+ 	"github.com/Gaurav-Gosain/tuios/internal/worktree"
+@@ -147,16 +148,10 @@ func repoRootParam(dir string) (string, *verbError) {
+ // it away because a session failed to start would be removing something the
+ // caller asked for and can still use. The session gets the caller's terminal
+ // from its hello, as one made by new-session does.
+-func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
+-	path := worktree.PathFor(worktree.DefaultDir(), root, branch)
+-	if _, err := os.Lstat(path); err == nil {
+-		return nil, hintedVerbError(ErrVerbGitFailed, path+" already exists", &VerbHint{
+-			Param:  "branch",
+-			Detail: "A worktree for this branch is already there. Attach to its session, or remove it with remove-worktree first.",
+-		})
+-	}
++func (d *Daemon) createWorktreeSession(cs *connState, root, anchor, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
++	repoName := gitstate.RepoName(root)
+ 	if sessionName == "" {
+-		sessionName = worktree.SessionName(filepath.Base(root), branch)
++		sessionName = worktree.SessionName(repoName, branch)
+ 	}
+ 	if err := ValidateSessionName(sessionName); err != nil {
+ 		return nil, invalidParam("name", err.Error())
+@@ -170,12 +165,44 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
+ 		})
+ 	}
+ 
+-	created, err := worktree.Add(root, path, branch, base)
+-	if err != nil {
+-		return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+-			Param:  "branch",
+-			Detail: "git refused to add the worktree. The repository is as it was.",
+-		})
++	var path string
++	var created bool
++	if provider := worktree.ActiveProvider(); provider != nil {
++		cmdAnchor := worktree.FindAnchor(anchor)
++		if cmdAnchor == "" {
++			cmdAnchor = worktree.FindAnchor(root)
++		}
++		if handled, err := provider.Handles(cmdAnchor); err != nil {
++			return nil, hintedVerbError(ErrVerbGitFailed, "worktree provider error: "+err.Error(), nil)
++		} else if handled {
++			createdPath, err := provider.Create(cmdAnchor, branch, base)
++			if err != nil {
++				return nil, hintedVerbError(ErrVerbGitFailed, "worktree provider refused: "+err.Error(), &VerbHint{
++					Param:  "branch",
++					Detail: "The worktree provider could not create the worktree.",
++				})
++			}
++			path = createdPath
++			created = true
++		}
++	}
++
++	if path == "" {
++		path = worktree.PathFor(worktree.DefaultDir(), root, branch)
++		if _, err := os.Lstat(path); err == nil {
++			return nil, hintedVerbError(ErrVerbGitFailed, path+" already exists", &VerbHint{
++				Param:  "branch",
++				Detail: "A worktree for this branch is already there. Attach to its session, or remove it with remove-worktree first.",
++			})
++		}
++		var err error
++		created, err = worktree.Add(root, path, branch, base)
++		if err != nil {
++			return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
++				Param:  "branch",
++				Detail: "git refused to add the worktree. The repository is as it was.",
++			})
++		}
+ 	}
+ 
+ 	sess, err := d.manager.CreateSession(sessionName, callerSessionConfig(cs), defaultVerbSessionWidth, defaultVerbSessionHeight)
+@@ -186,7 +213,7 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
+ 	}
+ 	info := &WorktreeInfo{
+ 		Info: worktree.Info{
+-			Repo:     filepath.Base(root),
++			Repo:     repoName,
+ 			RepoRoot: root,
+ 			Branch:   branch,
+ 			Path:     path,
+@@ -256,7 +283,15 @@ func (d *Daemon) verbNewWorktree(cs *connState, params json.RawMessage) (any, *v
+ 	if verr != nil {
+ 		return nil, verr
+ 	}
+-	out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
++	anchor := strings.TrimSpace(p.repoSource.Repo)
++	if anchor != "" {
++		if abs, err := filepath.Abs(anchor); err == nil {
++			anchor = abs
++		}
++	} else {
++		anchor = root
++	}
++	out, verr := d.createWorktreeSession(cs, root, anchor, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
+ 	if verr != nil {
+ 		return nil, verr
+ 	}
+@@ -735,9 +770,17 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
+ 	}
+ 
+ 	sessions := make([]map[string]any, 0, p.Count)
++	anchor := strings.TrimSpace(p.repoSource.Repo)
++	if anchor != "" {
++		if abs, err := filepath.Abs(anchor); err == nil {
++			anchor = abs
++		}
++	} else {
++		anchor = root
++	}
+ 	for i, branch := range branches {
+ 		launch, prompt := launches[i%len(launches)], promptFor(i)
+-		out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
++		out, verr := d.createWorktreeSession(cs, root, anchor, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
+ 			info.Group = stem
+ 			info.FanID = fanID
+ 			info.LaunchedFrom = launchedFrom
+diff --git a/internal/session/verb_worktree_test.go b/internal/session/verb_worktree_test.go
+index ebfec7e9..4e2ac939 100644
+--- a/internal/session/verb_worktree_test.go
++++ b/internal/session/verb_worktree_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"maps"
+ 	"os"
+ 	"path/filepath"
++	"runtime"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -321,6 +322,91 @@ func TestFanStemReadsLikeThePrompt(t *testing.T) {
+ 	}
+ }
+ 
++func TestProviderBackedWorktreeLifecycle(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping on windows")
++	}
++	d, sp, repo := worktreeFixture(t)
++	c := dialVerb(t, sp)
++
++	createdDir := filepath.Join(t.TempDir(), "provider-created-wt")
++	scriptPath := filepath.Join(t.TempDir(), "provider.sh")
++	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
++set -euo pipefail
++verb="${1:-}"
++shift || true
++repo="" branch="" base="" path="" force=0
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --repo) repo="$2"; shift 2 ;;
++    --branch) branch="$2"; shift 2 ;;
++    --base) base="$2"; shift 2 ;;
++    --path) path="$2"; shift 2 ;;
++    --force) force=1; shift ;;
++    *) shift ;;
++  esac
++done
++
++case "$verb" in
++  detect)
++    if [ "$repo" = "%s" ]; then
++      printf '{"handled":true}\n'
++    else
++      printf '{"handled":false}\n'
++    fi
++    ;;
++  resolve)
++    printf '{"path":"%s"}\n'
++    ;;
++  create)
++    git -C "$repo" worktree add -b "$branch" "%s" >&2
++    printf '{"path":"%s"}\n'
++    ;;
++  list)
++    printf '[{"path":"%s","branch":"%s"}]\n'
++    ;;
++  remove)
++    git -C "%s" worktree remove --force "$path" >&2
++    printf '{}\n'
++    ;;
++  *)
++    echo "unknown verb $verb" >&2
++    exit 2
++    ;;
++esac
++`, repo, createdDir, createdDir, createdDir, createdDir, "feat/provider-test", repo)
++
++	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	t.Setenv("TUIOS_WORKTREES_PROVIDER_COMMAND", scriptPath)
++
++	res := newWorktreeCall(t, c, repo, "feat/provider-test", nil)
++	gotPath, _ := res["path"].(string)
++	if gotPath != createdDir {
++		t.Fatalf("res[path] = %q, want %q", gotPath, createdDir)
++	}
++
++	sessName, _ := res["session"].(string)
++	sess := d.manager.GetSession(sessName)
++	if sess == nil {
++		t.Fatalf("session %q was not found in daemon", sessName)
++	}
++	if info := sess.Worktree(); info == nil || info.Path != createdDir {
++		t.Fatalf("session worktree path = %v, want %q", info, createdDir)
++	}
++
++	// Remove worktree via daemon verb
++	removeRes := result(t, c.call(t, fmt.Sprintf(`{"id":2,"verb":"remove-worktree","params":{"session":%q}}`, sessName)))
++	if removeRes["type"] != "worktree_removed" {
++		t.Fatalf("remove-worktree result = %+v, want worktree_removed", removeRes)
++	}
++	if d.manager.GetSession(sessName) != nil {
++		t.Fatalf("session %q was not killed after removal", sessName)
++	}
++}
++
+ // waitPromptStatus polls a session's record until the prompt reaches status.
+ func waitPromptStatus(t *testing.T, sess *Session, status string) *WorktreeInfo {
+ 	t.Helper()
+diff --git a/internal/worktree/provider.go b/internal/worktree/provider.go
+new file mode 100644
+index 00000000..ddd403fa
+--- /dev/null
++++ b/internal/worktree/provider.go
+@@ -0,0 +1,200 @@
++// Package worktree manages git worktrees and external worktree providers.
++package worktree
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/Gaurav-Gosain/tuios/internal/childproc"
++	"github.com/Gaurav-Gosain/tuios/internal/gitstate"
++)
++
++var customProviderCommand string
++
++// SetProviderCommand overrides the command line of the external worktree provider.
++// It is intended for testing and runtime configuration hooks.
++func SetProviderCommand(cmd string) {
++	customProviderCommand = cmd
++}
++
++// ProviderCommand returns the configured worktree provider command, if any.
++// It checks customProviderCommand first, then TUIOS_WORKTREES_PROVIDER_COMMAND,
++// and falls back to HERDR_WORKTREES_PROVIDER_COMMAND for compatibility with tools
++// configured for herdr.
++func ProviderCommand() string {
++	if customProviderCommand != "" {
++		return customProviderCommand
++	}
++	if cmd := os.Getenv("TUIOS_WORKTREES_PROVIDER_COMMAND"); cmd != "" {
++		return cmd
++	}
++	if cmd := os.Getenv("HERDR_WORKTREES_PROVIDER_COMMAND"); cmd != "" {
++		return cmd
++	}
++	return ""
++}
++
++// Provider manages worktrees through an external program instead of git worktree.
++// It follows the JSON-RPC contract used by Herdr:
++//
++//	<provider> detect  --repo <root>                              -> {"handled": true|false}
++//	<provider> resolve --repo <root> --branch <name>             -> {"path": "..."}
++//	<provider> create  --repo <root> --branch <name> --base <ref> -> {"path": "..."}
++//	<provider> list    --repo <root>                              -> [{"path":"...", "branch":"...", ...}]
++//	<provider> remove  --path <checkout> [--force]                -> {}
++type Provider struct {
++	Command string
++}
++
++// ActiveProvider returns a Provider instance if an external provider command is configured,
++// or nil when worktrees should use native git worktree operations.
++func ActiveProvider() *Provider {
++	cmd := strings.TrimSpace(ProviderCommand())
++	if cmd == "" {
++		return nil
++	}
++	return &Provider{Command: cmd}
++}
++
++// run invokes the provider command with verb and args, capturing stdout and stderr.
++func (p *Provider) run(ctx context.Context, verb string, args ...string) ([]byte, error) {
++	fullArgs := append([]string{verb}, args...)
++	cmd := childproc.CommandContext(ctx, p.Command, fullArgs...)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	if err := cmd.Run(); err != nil {
++		msg := strings.TrimSpace(stderr.String())
++		if msg == "" {
++			msg = err.Error()
++		}
++		return nil, fmt.Errorf("worktree provider %s failed: %s", verb, msg)
++	}
++	return stdout.Bytes(), nil
++}
++
++// Handles reports whether the provider manages worktrees for the repository anchor.
++func (p *Provider) Handles(repoRoot string) (bool, error) {
++	out, err := p.run(context.Background(), "detect", "--repo", repoRoot)
++	if err != nil {
++		return false, err
++	}
++	var res struct {
++		Handled bool `json:"handled"`
++	}
++	if err := json.Unmarshal(out, &res); err != nil {
++		return false, fmt.Errorf("invalid json from worktree provider detect: %w", err)
++	}
++	return res.Handled, nil
++}
++
++// Resolve asks the provider where a worktree for branch would land.
++func (p *Provider) Resolve(repoRoot, branch string) (string, error) {
++	out, err := p.run(context.Background(), "resolve", "--repo", repoRoot, "--branch", branch)
++	if err != nil {
++		return "", err
++	}
++	var res struct {
++		Path string `json:"path"`
++	}
++	if err := json.Unmarshal(out, &res); err != nil {
++		return "", fmt.Errorf("invalid json from worktree provider resolve: %w", err)
++	}
++	if res.Path == "" {
++		return "", errors.New("worktree provider resolve returned empty path")
++	}
++	return res.Path, nil
++}
++
++// Create creates a worktree for branch from base, returning the materialized checkout path.
++func (p *Provider) Create(repoRoot, branch, base string) (string, error) {
++	args := []string{"--repo", repoRoot, "--branch", branch}
++	if base != "" {
++		args = append(args, "--base", base)
++	}
++	out, err := p.run(context.Background(), "create", args...)
++	if err != nil {
++		return "", err
++	}
++	var res struct {
++		Path string `json:"path"`
++	}
++	if err := json.Unmarshal(out, &res); err != nil {
++		return "", fmt.Errorf("invalid json from worktree provider create: %w", err)
++	}
++	if res.Path == "" {
++		return "", errors.New("worktree provider create returned empty path")
++	}
++	return res.Path, nil
++}
++
++// List lists the worktrees known to the provider for the repository.
++func (p *Provider) List(repoRoot string) ([]Entry, error) {
++	out, err := p.run(context.Background(), "list", "--repo", repoRoot)
++	if err != nil {
++		return nil, err
++	}
++	var raw []struct {
++		Path     string `json:"path"`
++		Branch   string `json:"branch"`
++		Bare     bool   `json:"bare"`
++		Detached bool   `json:"detached"`
++		Prunable bool   `json:"prunable"`
++	}
++	if err := json.Unmarshal(out, &raw); err != nil {
++		return nil, fmt.Errorf("invalid json from worktree provider list: %w", err)
++	}
++	entries := make([]Entry, 0, len(raw))
++	for _, r := range raw {
++		entries = append(entries, Entry{
++			Path:     r.Path,
++			Branch:   r.Branch,
++			Bare:     r.Bare,
++			Detached: r.Detached,
++			Prunable: r.Prunable,
++			Linked:   true,
++		})
++	}
++	return entries, nil
++}
++
++// Remove removes the worktree at path.
++func (p *Provider) Remove(path string, force bool) error {
++	args := []string{"--path", path}
++	if force {
++		args = append(args, "--force")
++	}
++	_, err := p.run(context.Background(), "remove", args...)
++	return err
++}
++
++// FindAnchor returns a working checkout directory for dir.
++// If dir is inside a worktree checkout or main checkout, its checkout root is returned.
++// If dir is a bare repository (commonDir), it inspects existing worktrees
++// to find an existing checkout that can serve as the command anchor.
++func FindAnchor(dir string) string {
++	dir = filepath.Clean(dir)
++	if _, _, root, ok := gitstate.Locate(dir); ok && root != "" {
++		if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
++			return root
++		}
++	}
++	// Bare repo fallback: inspect linked worktrees to find an anchor checkout.
++	if out, err := run(dir, "worktree", "list", "--porcelain"); err == nil {
++		entries := parseWorktreeList(out)
++		for _, e := range entries {
++			if e.Linked && !e.Bare && e.Path != "" {
++				if _, err := os.Stat(e.Path); err == nil {
++					return e.Path
++				}
++			}
++		}
++	}
++	return dir
++}
+diff --git a/internal/worktree/provider_test.go b/internal/worktree/provider_test.go
+new file mode 100644
+index 00000000..23a70ae0
+--- /dev/null
++++ b/internal/worktree/provider_test.go
+@@ -0,0 +1,189 @@
++package worktree
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"testing"
++)
++
++func writeMockProvider(t *testing.T, handledRepo, createdPath string) string {
++	t.Helper()
++	if runtime.GOOS == "windows" {
++		t.Skip("mock provider shell script requires unix")
++	}
++	dir := t.TempDir()
++	script := filepath.Join(dir, "provider.sh")
++	content := fmt.Sprintf(`#!/usr/bin/env bash
++set -euo pipefail
++verb="${1:-}"
++shift || true
++repo=""
++branch=""
++base=""
++path=""
++force=0
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --repo) repo="$2"; shift 2 ;;
++    --branch) branch="$2"; shift 2 ;;
++    --base) base="$2"; shift 2 ;;
++    --path) path="$2"; shift 2 ;;
++    --force) force=1; shift ;;
++    *) shift ;;
++  esac
++done
++
++case "$verb" in
++  detect)
++    if [ "$repo" = "%s" ]; then
++      printf '{"handled":true}\n'
++    else
++      printf '{"handled":false}\n'
++    fi
++    ;;
++  resolve)
++    printf '{"path":"%s"}\n'
++    ;;
++  create)
++    printf '{"path":"%s"}\n'
++    ;;
++  list)
++    printf '[{"path":"%s","branch":"main","detached":false}]\n'
++    ;;
++  remove)
++    printf '{}\n'
++    ;;
++  *)
++    echo "unknown verb $verb" >&2
++    exit 2
++    ;;
++esac
++`, handledRepo, createdPath, createdPath, handledRepo)
++
++	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	return script
++}
++
++func TestProviderCommandEnv(t *testing.T) {
++	SetProviderCommand("")
++	defer SetProviderCommand("")
++
++	t.Setenv("TUIOS_WORKTREES_PROVIDER_COMMAND", "")
++	t.Setenv("HERDR_WORKTREES_PROVIDER_COMMAND", "")
++	if got := ProviderCommand(); got != "" {
++		t.Errorf("ProviderCommand() = %q, want empty", got)
++	}
++
++	t.Setenv("HERDR_WORKTREES_PROVIDER_COMMAND", "/path/to/herdr-provider")
++	if got := ProviderCommand(); got != "/path/to/herdr-provider" {
++		t.Errorf("ProviderCommand() = %q, want herdr fallback", got)
++	}
++
++	t.Setenv("TUIOS_WORKTREES_PROVIDER_COMMAND", "/path/to/tuios-provider")
++	if got := ProviderCommand(); got != "/path/to/tuios-provider" {
++		t.Errorf("ProviderCommand() = %q, want tuios override", got)
++	}
++
++	SetProviderCommand("/path/to/custom-provider")
++	if got := ProviderCommand(); got != "/path/to/custom-provider" {
++		t.Errorf("ProviderCommand() = %q, want custom provider", got)
++	}
++}
++
++func TestProviderLifecycle(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping on windows")
++	}
++	handledRepo := "/tmp/monorepo/workspaces/root"
++	createdPath := "/tmp/monorepo/workspaces/test-branch"
++	script := writeMockProvider(t, handledRepo, createdPath)
++
++	SetProviderCommand(script)
++	defer SetProviderCommand("")
++
++	p := ActiveProvider()
++	if p == nil {
++		t.Fatal("ActiveProvider() is nil, want configured provider")
++	}
++
++	// Test Handles
++	handled, err := p.Handles(handledRepo)
++	if err != nil {
++		t.Fatalf("Handles(%q) failed: %v", handledRepo, err)
++	}
++	if !handled {
++		t.Errorf("Handles(%q) = false, want true", handledRepo)
++	}
++
++	otherRepo := "/tmp/other/repo"
++	handled, err = p.Handles(otherRepo)
++	if err != nil {
++		t.Fatalf("Handles(%q) failed: %v", otherRepo, err)
++	}
++	if handled {
++		t.Errorf("Handles(%q) = true, want false", otherRepo)
++	}
++
++	// Test Resolve
++	resPath, err := p.Resolve(handledRepo, "test-branch")
++	if err != nil {
++		t.Fatalf("Resolve failed: %v", err)
++	}
++	if resPath != createdPath {
++		t.Errorf("Resolve = %q, want %q", resPath, createdPath)
++	}
++
++	// Test Create
++	newPath, err := p.Create(handledRepo, "test-branch", "HEAD")
++	if err != nil {
++		t.Fatalf("Create failed: %v", err)
++	}
++	if newPath != createdPath {
++		t.Errorf("Create = %q, want %q", newPath, createdPath)
++	}
++
++	// Test List
++	entries, err := p.List(handledRepo)
++	if err != nil {
++		t.Fatalf("List failed: %v", err)
++	}
++	if len(entries) != 1 || entries[0].Path != handledRepo {
++		t.Errorf("List = %+v, want single entry for %s", entries, handledRepo)
++	}
++
++	// Test Remove
++	if err := p.Remove(createdPath, false); err != nil {
++		t.Fatalf("Remove failed: %v", err)
++	}
++}
++
++func TestProviderIntegrationWithListAndRemove(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping on windows")
++	}
++	handledRepo := "/tmp/monorepo/workspaces/root"
++	createdPath := "/tmp/monorepo/workspaces/test-branch"
++	script := writeMockProvider(t, handledRepo, createdPath)
++
++	SetProviderCommand(script)
++	defer SetProviderCommand("")
++
++	// List delegates to provider when provider handles the directory
++	entries, err := List(handledRepo)
++	if err != nil {
++		t.Fatalf("List(%q) failed: %v", handledRepo, err)
++	}
++	if len(entries) != 1 || entries[0].Path != handledRepo {
++		t.Errorf("List(%q) = %+v, want provider entries", handledRepo, entries)
++	}
++
++	// Remove delegates to provider when provider handles the path
++	if err := Remove(handledRepo, createdPath, true); err != nil {
++		t.Fatalf("Remove failed: %v", err)
++	}
++}
+diff --git a/internal/worktree/worktree.go b/internal/worktree/worktree.go
+index 294afa6a..7ba174ba 100644
+--- a/internal/worktree/worktree.go
++++ b/internal/worktree/worktree.go
+@@ -393,11 +393,25 @@ func Stash(path, message string) error {
+ 	return err
+ }
+ 
+-// Remove takes a worktree away with "git worktree remove". Without force git
+-// refuses a worktree holding uncommitted changes, and so does this. The
++// Remove takes a worktree away with "git worktree remove", or with the external
++// worktree provider when one is configured and manages the worktree. Without force
++// git refuses a worktree holding uncommitted changes, and so does this. The
+ // branch is never touched: it stays in the repository with every commit the
+ // worktree made.
+ func Remove(repoRoot, path string, force bool) error {
++	if p := ActiveProvider(); p != nil {
++		if handled, err := p.Handles(path); err != nil {
++			return err
++		} else if handled {
++			return p.Remove(path, force)
++		}
++		anchor := FindAnchor(repoRoot)
++		if handled, err := p.Handles(anchor); err != nil {
++			return err
++		} else if handled {
++			return p.Remove(path, force)
++		}
++	}
+ 	args := []string{"worktree", "remove"}
+ 	if force {
+ 		args = append(args, "--force")
+@@ -485,8 +499,17 @@ type Entry struct {
+ }
+ 
+ // List returns every checkout of the repository dir is in, the main one
+-// first, as git worktree list --porcelain reports them.
++// first, as git worktree list --porcelain reports them, or as the external
++// worktree provider reports them when one manages this repository.
+ func List(dir string) ([]Entry, error) {
++	if p := ActiveProvider(); p != nil {
++		anchor := FindAnchor(dir)
++		if handled, err := p.Handles(anchor); err != nil {
++			return nil, err
++		} else if handled {
++			return p.List(anchor)
++		}
++	}
+ 	out, err := run(dir, "worktree", "list", "--porcelain")
+ 	if err != nil {
+ 		return nil, err
+-- 
+2.55.0-shop-3bea710f
+

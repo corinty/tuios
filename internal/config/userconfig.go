@@ -68,6 +68,9 @@ type UserConfig struct {
 	// Workspaces is the [workspaces] table: what happens when the workspace
 	// on screen loses its last pane. See workspaces.go.
 	Workspaces WorkspacesConfig `toml:"workspaces"`
+	// Worktrees is the [worktrees] table: directory and external provider command.
+	// See worktrees.go.
+	Worktrees WorktreesConfig `toml:"worktrees"`
 
 	// PasteBuffers is the [paste_buffers] table: how many yanks tuios keeps
 	// to paste again. See paste_buffers.go.
