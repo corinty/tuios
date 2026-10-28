@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -318,6 +319,91 @@ func TestFanStemReadsLikeThePrompt(t *testing.T) {
 		if got := fanStem(in); got != want {
 			t.Errorf("fanStem(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestProviderBackedWorktreeLifecycle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+	d, sp, repo := worktreeFixture(t)
+	c := dialVerb(t, sp)
+
+	createdDir := filepath.Join(t.TempDir(), "provider-created-wt")
+	scriptPath := filepath.Join(t.TempDir(), "provider.sh")
+	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+verb="${1:-}"
+shift || true
+repo="" branch="" base="" path="" force=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo="$2"; shift 2 ;;
+    --branch) branch="$2"; shift 2 ;;
+    --base) base="$2"; shift 2 ;;
+    --path) path="$2"; shift 2 ;;
+    --force) force=1; shift ;;
+    *) shift ;;
+  esac
+done
+
+case "$verb" in
+  detect)
+    if [ "$repo" = "%s" ]; then
+      printf '{"handled":true}\n'
+    else
+      printf '{"handled":false}\n'
+    fi
+    ;;
+  resolve)
+    printf '{"path":"%s"}\n'
+    ;;
+  create)
+    git -C "$repo" worktree add -b "$branch" "%s" >&2
+    printf '{"path":"%s"}\n'
+    ;;
+  list)
+    printf '[{"path":"%s","branch":"%s"}]\n'
+    ;;
+  remove)
+    git -C "%s" worktree remove --force "$path" >&2
+    printf '{}\n'
+    ;;
+  *)
+    echo "unknown verb $verb" >&2
+    exit 2
+    ;;
+esac
+`, repo, createdDir, createdDir, createdDir, createdDir, "feat/provider-test", repo)
+
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("TUIOS_WORKTREES_PROVIDER_COMMAND", scriptPath)
+
+	res := newWorktreeCall(t, c, repo, "feat/provider-test", nil)
+	gotPath, _ := res["path"].(string)
+	if gotPath != createdDir {
+		t.Fatalf("res[path] = %q, want %q", gotPath, createdDir)
+	}
+
+	sessName, _ := res["session"].(string)
+	sess := d.manager.GetSession(sessName)
+	if sess == nil {
+		t.Fatalf("session %q was not found in daemon", sessName)
+	}
+	if info := sess.Worktree(); info == nil || info.Path != createdDir {
+		t.Fatalf("session worktree path = %v, want %q", info, createdDir)
+	}
+
+	// Remove worktree via daemon verb
+	removeRes := result(t, c.call(t, fmt.Sprintf(`{"id":2,"verb":"remove-worktree","params":{"session":%q}}`, sessName)))
+	if removeRes["type"] != "worktree_removed" {
+		t.Fatalf("remove-worktree result = %+v, want worktree_removed", removeRes)
+	}
+	if d.manager.GetSession(sessName) != nil {
+		t.Fatalf("session %q was not killed after removal", sessName)
 	}
 }
 

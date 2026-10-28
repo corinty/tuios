@@ -6,6 +6,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
+	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 )
 
 // DaemonConfigFromUser maps the parts of the user's config file the daemon
@@ -48,6 +49,9 @@ func DaemonConfigFromUser(uc *config.UserConfig) *DaemonConfig {
 	cfg.SingleClient = uc.Daemon.SingleClient
 	cfg.SSHAgent = uc.Daemon.SSHAgent
 	cfg.Display = uc.Daemon.Display
+	if uc.Worktrees.ProviderCommand != "" {
+		worktree.SetProviderCommand(uc.Worktrees.ProviderCommand)
+	}
 	cfg.History = ResolveHistoryPolicy(uc.Daemon.PersistScrollback, uc.Daemon.PersistScrollbackLines, uc.Daemon.PersistScrollbackKB)
 	cfg.Hosts = HostsFromConfig(uc)
 	// The same table says what each machine linked to this one may do here.
