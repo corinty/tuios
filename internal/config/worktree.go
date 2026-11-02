@@ -14,6 +14,11 @@ type WorktreeConfig struct {
 	// worktree.RenderPath for what it may hold. Empty is the default,
 	// $XDG_DATA_HOME/tuios/worktrees/<repo>/<branch slug>.
 	Path string `toml:"path"`
+	// ProviderCommand is an external program that manages worktrees in place
+	// of git worktree. When set, tuios hands create, list and remove to it for
+	// every repository it claims, using the provider JSON contract in
+	// internal/worktree/provider.go. Repositories it does not claim use git.
+	ProviderCommand string `toml:"provider_command"`
 }
 
 func validateWorktree(cfg *UserConfig, result *ValidationResult) {
@@ -21,6 +26,12 @@ func validateWorktree(cfg *UserConfig, result *ValidationResult) {
 		result.Warnings = append(result.Warnings, ValidationError{
 			Field: "worktree", Key: "path",
 			Message: err.Error() + "; new worktrees are refused until it is fixed",
+		})
+	}
+	if err := worktree.ValidateProviderCommand(cfg.Worktree.ProviderCommand); err != nil {
+		result.Warnings = append(result.Warnings, ValidationError{
+			Field: "worktree", Key: "provider_command",
+			Message: err.Error() + "; worktree commands fail until it is fixed",
 		})
 	}
 }

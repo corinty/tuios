@@ -382,11 +382,25 @@ func Stash(path, message string) error {
 	return err
 }
 
-// Remove takes a worktree away with "git worktree remove". Without force git
-// refuses a worktree holding uncommitted changes, and so does this. The
+// Remove takes a worktree away with "git worktree remove", or with the external
+// worktree provider when one is configured and manages the worktree. Without force
+// git refuses a worktree holding uncommitted changes, and so does this. The
 // branch is never touched: it stays in the repository with every commit the
 // worktree made.
 func Remove(repoRoot, path string, force bool) error {
+	// The checkout itself is asked first, then the main checkout, so a
+	// provider that claims only one of them still gets its own worktree back.
+	// A provider that cannot answer stops the removal: git removing a
+	// checkout the provider made would leave the provider's records behind.
+	for _, dir := range []string{path, repoRoot} {
+		p, _, err := ProviderFor(dir)
+		if err != nil {
+			return err
+		}
+		if p != nil {
+			return p.Remove(path, force)
+		}
+	}
 	args := []string{"worktree", "remove"}
 	if force {
 		args = append(args, "--force")
@@ -474,8 +488,16 @@ type Entry struct {
 }
 
 // List returns every checkout of the repository dir is in, the main one
-// first, as git worktree list --porcelain reports them.
+// first, as git worktree list --porcelain reports them, or as the external
+// worktree provider reports them when one manages this repository.
 func List(dir string) ([]Entry, error) {
+	// A provider's checkouts are git worktrees too, so when the provider
+	// cannot answer, git's list is a fair one to show rather than none.
+	if p, anchor, err := ProviderFor(dir); err == nil && p != nil {
+		if entries, err := p.List(anchor); err == nil {
+			return entries, nil
+		}
+	}
 	out, err := run(dir, "worktree", "list", "--porcelain")
 	if err != nil {
 		return nil, err

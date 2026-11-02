@@ -1974,6 +1974,56 @@ Empty is the default. While it is empty, `TUIOS_WORKTREE_DIR` in the daemon's
 environment still moves the default folder (see
 [CLI_REFERENCE.md](CLI_REFERENCE.md#tuios_worktree_dir)).
 
+### An external worktree provider
+
+`[worktree] provider_command` hands worktrees to another program in place of
+`git worktree`. Use it for a monorepo whose checkouts a workspace tool must
+set up, such as a sparse checkout:
+
+```toml
+[worktree]
+provider_command = "/path/to/provider"
+```
+
+tuios runs the program with a verb and reads JSON from its stdout:
+
+| Call | Output |
+|---|---|
+| `detect --repo <root>` | `{"handled": true}` or `{"handled": false}` |
+| `resolve --repo <root> --branch <name>` | `{"path": "..."}` |
+| `create --repo <root> --branch <name> --base <ref>` | `{"path": "..."}` |
+| `list --repo <root>` | `[{"path": "...", "branch": "..."}]` |
+| `remove --path <checkout> [--force]` | `{}` |
+
+A repository the program does not claim with `detect` uses `git worktree` and
+`[worktree] path`. The program owns where its checkouts go, so `path` does not
+apply to them. When the setting is empty, `TUIOS_WORKTREES_PROVIDER_COMMAND`,
+then `HERDR_WORKTREES_PROVIDER_COMMAND`, in the daemon's environment names
+the program. A leading `~/` is your home folder. A pane cannot change it with
+`set-option`, because it names a program the daemon runs.
+
+How tuios calls the program:
+
+- `detect` answers are kept for five minutes per repository. A config change
+  drops them. A failed `detect` is not kept.
+- `resolve` lets tuios refuse a branch whose folder already exists before it
+  runs `create`, and lets `tuios fan` skip names whose folders are taken. A
+  program that cannot answer `resolve` still gets `create`.
+- One `create` or `remove` runs at a time, so a program that finds its new
+  checkout by comparing a folder before and after sees only its own.
+- `create` must print an absolute path to a folder that holds a git checkout.
+  Anything else is an error, and no session starts.
+- `detect`, `resolve` and `list` have 30 seconds. `create` and `remove` have
+  20 minutes. At the limit, tuios ends the program and everything it started.
+- When `list` fails, tuios shows `git worktree list`, since the program's
+  checkouts are git worktrees too. When `detect` fails on a removal, nothing
+  is removed: git removing a checkout the program made would leave the
+  program's records behind.
+- A failed call's error ends with the last 2 KiB of the program's stderr.
+
+Config validation warns when the command is not an absolute path to an
+executable file.
+
 ## Where a review opens
 
 The review overlay (`ctrl+b v`) opens with the keys on the diff. `tab` moves

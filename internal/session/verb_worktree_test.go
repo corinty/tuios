@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -300,7 +301,10 @@ func TestFanBranchesSkipNamesThatExist(t *testing.T) {
 	t.Setenv("TUIOS_WORKTREE_DIR", filepath.Join(t.TempDir(), "worktrees"))
 	testutil.Git(t, repo, "branch", "try")
 	testutil.Git(t, repo, "branch", "try-3")
-	got := fanBranches("", repo, "try", 3)
+	got := fanBranches(func(branch string) string {
+		path, _ := worktree.PathFor("", repo, branch)
+		return path
+	}, repo, "try", 3)
 	want := []string{"try-2", "try-4", "try-5"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("fanBranches = %v, want %v", got, want)
@@ -321,6 +325,95 @@ func TestFanStemReadsLikeThePrompt(t *testing.T) {
 	}
 }
 
+func TestProviderBackedWorktreeLifecycle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+	d, sp, repo := worktreeFixture(t)
+	c := dialVerb(t, sp)
+
+	createdDir := filepath.Join(t.TempDir(), "provider-created-wt")
+	scriptPath := filepath.Join(t.TempDir(), "provider.sh")
+	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+verb="${1:-}"
+shift || true
+repo="" branch="" base="" path="" force=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo="$2"; shift 2 ;;
+    --branch) branch="$2"; shift 2 ;;
+    --base) base="$2"; shift 2 ;;
+    --path) path="$2"; shift 2 ;;
+    --force) force=1; shift ;;
+    *) shift ;;
+  esac
+done
+
+case "$verb" in
+  detect)
+    if [ "$repo" = "%s" ]; then
+      printf '{"handled":true}\n'
+    else
+      printf '{"handled":false}\n'
+    fi
+    ;;
+  resolve)
+    printf '{"path":"%s"}\n'
+    ;;
+  create)
+    git -C "$repo" worktree add -b "$branch" "%s" >&2
+    printf '{"path":"%s"}\n'
+    ;;
+  list)
+    printf '[{"path":"%s","branch":"%s"}]\n'
+    ;;
+  remove)
+    git -C "%s" worktree remove --force "$path" >&2
+    printf '{}\n'
+    ;;
+  *)
+    echo "unknown verb $verb" >&2
+    exit 2
+    ;;
+esac
+`, repo, createdDir, createdDir, createdDir, createdDir, "feat/provider-test", repo)
+
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("TUIOS_WORKTREES_PROVIDER_COMMAND", scriptPath)
+
+	res := newWorktreeCall(t, c, repo, "feat/provider-test", nil)
+	gotPath, _ := res["path"].(string)
+	if gotPath != createdDir {
+		t.Fatalf("res[path] = %q, want %q", gotPath, createdDir)
+	}
+
+	if created, _ := res["created_branch"].(bool); !created {
+		t.Errorf("created_branch = %v, want true for a branch the provider made", res["created_branch"])
+	}
+
+	sessName, _ := res["session"].(string)
+	sess := d.manager.GetSession(sessName)
+	if sess == nil {
+		t.Fatalf("session %q was not found in daemon", sessName)
+	}
+	if info := sess.Worktree(); info == nil || info.Path != createdDir {
+		t.Fatalf("session worktree path = %v, want %q", info, createdDir)
+	}
+
+	// Remove worktree via daemon verb
+	removeRes := result(t, c.call(t, fmt.Sprintf(`{"id":2,"verb":"remove-worktree","params":{"session":%q}}`, sessName)))
+	if removeRes["type"] != "worktree_removed" {
+		t.Fatalf("remove-worktree result = %+v, want worktree_removed", removeRes)
+	}
+	if d.manager.GetSession(sessName) != nil {
+		t.Fatalf("session %q was not killed after removal", sessName)
+	}
+}
+
 // waitPromptStatus polls a session's record until the prompt reaches status.
 func waitPromptStatus(t *testing.T, sess *Session, status string) *WorktreeInfo {
 	t.Helper()
@@ -333,4 +426,96 @@ func waitPromptStatus(t *testing.T, sess *Session, status string) *WorktreeInfo 
 	}
 	t.Fatalf("the prompt never reached %q: %+v", status, sess.Worktree())
 	return nil
+}
+
+// writeProvider writes a provider script that claims repo, resolves every
+// branch to resolveDir/<branch>, and records each create in log.
+func writeProvider(t *testing.T, repo, resolveDir, log string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "provider.sh")
+	body := fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+verb="${1:-}"; shift || true
+repo="" branch=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo="$2"; shift 2 ;;
+    --branch) branch="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$verb" in
+  detect) if [ "$repo" = %q ]; then echo '{"handled":true}'; else echo '{"handled":false}'; fi ;;
+  resolve) printf '{"path":"%%s/%%s"}\n' %q "$branch" ;;
+  create) echo "$branch" >> %q; echo "create should not run" >&2; exit 1 ;;
+  *) echo '[]' ;;
+esac
+`, repo, resolveDir, log)
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+func TestProviderResolveRefusesATakenFolder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("provider scripts need bash")
+	}
+	_, sp, repo := worktreeFixture(t)
+	c := dialVerb(t, sp)
+	trees := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(trees, "taken"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(t.TempDir(), "creates")
+	t.Setenv("TUIOS_WORKTREES_PROVIDER_COMMAND", writeProvider(t, repo, trees, log))
+	worktree.ResetProviderCache()
+
+	resp := c.call(t, `{"id":1,"verb":"new-worktree","params":`+jsonParams(map[string]any{"repo": repo, "branch": "taken"})+`}`)
+	e := errorOf(t, resp)
+	if msg, _ := e["message"].(string); !strings.Contains(msg, "already exists") {
+		t.Fatalf("error = %v, want already exists", e)
+	}
+	if b, err := os.ReadFile(log); err == nil && len(b) > 0 {
+		t.Errorf("the provider was asked to create %q after resolve named a taken folder", strings.TrimSpace(string(b)))
+	}
+}
+
+func TestPlaceWorktreeAsksTheProvider(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("provider scripts need bash")
+	}
+	d, _, repo := worktreeFixture(t)
+	trees := t.TempDir()
+	t.Setenv("TUIOS_WORKTREES_PROVIDER_COMMAND", writeProvider(t, repo, trees, filepath.Join(t.TempDir(), "log")))
+	worktree.ResetProviderCache()
+
+	place, verr := d.placeWorktree("", repo, repo, "feat-x")
+	if verr != nil {
+		t.Fatal(verr)
+	}
+	if place.provider == nil || place.path != filepath.Join(trees, "feat-x") {
+		t.Fatalf("place = %+v, want the provider's resolve path", place)
+	}
+
+	other := testutil.GitRepo(t)
+	place, verr = d.placeWorktree("", other, other, "feat-x")
+	if verr != nil {
+		t.Fatal(verr)
+	}
+	if place.provider != nil {
+		t.Fatalf("place = %+v, want git for a repository the provider does not claim", place)
+	}
+}
+
+func TestFanBranchesSkipFoldersThePlacerTook(t *testing.T) {
+	repo := testutil.GitRepo(t)
+	trees := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(trees, "try"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := fanBranches(func(branch string) string { return filepath.Join(trees, branch) }, repo, "try", 2)
+	if want := []string{"try-2", "try-3"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("fanBranches = %v, want %v", got, want)
+	}
 }

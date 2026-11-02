@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Gaurav-Gosain/tuios/internal/gitstate"
 	"github.com/Gaurav-Gosain/tuios/internal/hooks"
 	"github.com/Gaurav-Gosain/tuios/internal/plural"
 	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
@@ -170,26 +171,70 @@ func worktreePathFor(template, root, branch string) (string, *verbError) {
 	return path, nil
 }
 
+// providerAnchor is the checkout a worktree provider is asked about: the
+// folder the caller named, else the repository root.
+func providerAnchor(src repoSource, root string) string {
+	anchor := strings.TrimSpace(src.Repo)
+	if anchor == "" {
+		return root
+	}
+	if abs, err := filepath.Abs(anchor); err == nil {
+		return abs
+	}
+	return anchor
+}
+
+// worktreePlace is where a new worktree of a branch goes and what makes it.
+type worktreePlace struct {
+	// path is where the worktree will be. It is empty when a provider makes
+	// it and cannot say where in advance.
+	path string
+	// provider makes the worktree when it claims the repository. Nil means
+	// git worktree add at path.
+	provider *worktree.Provider
+	// anchor is the checkout the provider runs from.
+	anchor string
+}
+
+// placeWorktree works out where a worktree of branch goes. A provider that
+// claims the folder the caller named, or the repository root, places it with
+// resolve. Otherwise the [worktree] path template does.
+func (d *Daemon) placeWorktree(template, root, anchor, branch string) (worktreePlace, *verbError) {
+	p, cmdAnchor, err := worktree.ProviderFor(anchor)
+	if err == nil && p == nil && anchor != root {
+		p, cmdAnchor, err = worktree.ProviderFor(root)
+	}
+	if err != nil {
+		return worktreePlace{}, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+			Detail: "The worktree provider in [worktree] provider_command could not say whether it manages this repository. Nothing was created.",
+		})
+	}
+	if p != nil {
+		place := worktreePlace{provider: p, anchor: cmdAnchor}
+		// resolve only lets tuios refuse a taken folder early and pick free
+		// fan names. A provider that cannot answer still gets to create.
+		if path, err := p.Resolve(cmdAnchor, branch); err == nil {
+			place.path = path
+		}
+		return place, nil
+	}
+	path, verr := worktreePathFor(template, root, branch)
+	if verr != nil {
+		return worktreePlace{}, verr
+	}
+	return worktreePlace{path: path}, nil
+}
+
 // createWorktreeSession is what new-worktree and fan share: the worktree, then
 // the session in it, then the record that ties them. The worktree is never
 // removed on a later failure. It exists on disk and git lists it, and taking
 // it away because a session failed to start would be removing something the
 // caller asked for and can still use. The session gets the caller's terminal
 // from its hello, as one made by new-session does.
-func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
-	template := d.worktreeTemplate()
-	path, verr := worktreePathFor(template, root, branch)
-	if verr != nil {
-		return nil, verr
-	}
-	if _, err := os.Lstat(path); err == nil {
-		return nil, hintedVerbError(ErrVerbGitFailed, path+" already exists", &VerbHint{
-			Param:  "branch",
-			Detail: "A worktree for this branch is already there. Attach to its session, or remove it with remove-worktree first.",
-		})
-	}
+func (d *Daemon) createWorktreeSession(cs *connState, root, anchor, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
+	repoName := gitstate.RepoName(root)
 	if sessionName == "" {
-		sessionName = worktree.SessionName(filepath.Base(root), branch)
+		sessionName = worktree.SessionName(repoName, branch)
 	}
 	if err := ValidateSessionName(sessionName); err != nil {
 		return nil, invalidParam("name", err.Error())
@@ -203,12 +248,45 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
 		})
 	}
 
-	created, err := worktree.Add(root, path, branch, base)
-	if err != nil {
-		return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
-			Param:  "branch",
-			Detail: "git refused to add the worktree. The repository is as it was.",
-		})
+	template := d.worktreeTemplate()
+	place, verr := d.placeWorktree(template, root, anchor, branch)
+	if verr != nil {
+		return nil, verr
+	}
+	if place.path != "" {
+		if _, err := os.Lstat(place.path); err == nil {
+			return nil, hintedVerbError(ErrVerbGitFailed, place.path+" already exists", &VerbHint{
+				Param:  "branch",
+				Detail: "A worktree for this branch is already there. Attach to its session, or remove it with remove-worktree first.",
+			})
+		}
+	}
+
+	var path string
+	var created bool
+	viaProvider := place.provider != nil
+	if viaProvider {
+		// The provider does not say whether it made the branch, so tuios
+		// looks before, as git worktree add would have told it.
+		existed := worktree.BranchExists(root, branch)
+		createdPath, err := place.provider.Create(place.anchor, branch, base)
+		if err != nil {
+			return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+				Param:  "branch",
+				Detail: "The worktree provider in [worktree] provider_command could not create the worktree.",
+			})
+		}
+		path, created = createdPath, !existed
+	} else {
+		path = place.path
+		var err error
+		created, err = worktree.Add(root, path, branch, base)
+		if err != nil {
+			return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+				Param:  "branch",
+				Detail: "git refused to add the worktree. The repository is as it was.",
+			})
+		}
 	}
 
 	sess, err := d.manager.CreateSession(sessionName, callerSessionConfig(cs), defaultVerbSessionWidth, defaultVerbSessionHeight)
@@ -219,7 +297,7 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
 	}
 	info := &WorktreeInfo{
 		Info: worktree.Info{
-			Repo:     filepath.Base(root),
+			Repo:     repoName,
 			RepoRoot: root,
 			Branch:   branch,
 			Path:     path,
@@ -276,8 +354,12 @@ func (d *Daemon) createWorktreeSession(cs *connState, root, branch, base, sessio
 	if hookErr != "" {
 		out["hook_error"] = hookErr
 	}
-	if warning := unignoredWorktreeWarning(template, root, path); warning != "" {
-		out["warning"] = warning
+	// A provider owns where its checkouts go, so the [worktree] path warning
+	// applies only to worktrees tuios placed itself.
+	if !viaProvider {
+		if warning := unignoredWorktreeWarning(template, root, path); warning != "" {
+			out["warning"] = warning
+		}
 	}
 	return out, nil
 }
@@ -360,7 +442,8 @@ func (d *Daemon) verbNewWorktree(cs *connState, params json.RawMessage) (any, *v
 	if verr != nil {
 		return nil, verr
 	}
-	out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
+	anchor := providerAnchor(p.repoSource, root)
+	out, verr := d.createWorktreeSession(cs, root, anchor, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
 	if verr != nil {
 		return nil, verr
 	}
@@ -684,7 +767,7 @@ func fanStem(prompt string) string {
 // repository and on disk: stem, then stem-2, stem-3, and so on, skipping any
 // that exist. Numbering from 2 keeps the first name bare, so a fan of one
 // reads like a worktree made by hand.
-func fanBranches(template, root, stem string, count int) []string {
+func fanBranches(placeFor func(branch string) string, root, stem string, count int) []string {
 	names := make([]string, 0, count)
 	for i := 1; len(names) < count && i < count+100; i++ {
 		name := stem
@@ -694,8 +777,8 @@ func fanBranches(template, root, stem string, count int) []string {
 		if worktree.BranchExists(root, name) {
 			continue
 		}
-		// A template that does not render is reported by the create.
-		if path, err := worktree.PathFor(template, root, name); err == nil {
+		// A place that cannot be worked out is reported by the create.
+		if path := placeFor(name); path != "" {
 			if _, err := os.Lstat(path); err == nil {
 				continue
 			}
@@ -846,7 +929,14 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	if _, verr := worktreePathFor(template, root, stem); verr != nil {
 		return nil, verr
 	}
-	branches := fanBranches(template, root, stem, p.Count)
+	anchor := providerAnchor(p.repoSource, root)
+	branches := fanBranches(func(branch string) string {
+		place, verr := d.placeWorktree(template, root, anchor, branch)
+		if verr != nil {
+			return ""
+		}
+		return place.path
+	}, root, stem, p.Count)
 	if len(branches) < p.Count {
 		return nil, invalidParam("name", "could not find "+strconv.Itoa(p.Count)+" free branch names from "+stem)
 	}
@@ -876,7 +966,7 @@ func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError
 	}
 	for i, branch := range branches {
 		launch, prompt := launches[i%len(launches)], promptFor(i)
-		out, verr := d.createWorktreeSession(cs, root, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
+		out, verr := d.createWorktreeSession(cs, root, anchor, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
 			info.Group = stem
 			info.FanID = fanID
 			info.LaunchedFrom = launchedFrom

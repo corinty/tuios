@@ -12,6 +12,7 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/federation"
+	"github.com/Gaurav-Gosain/tuios/internal/worktree"
 )
 
 // Hot reload for the [hosts] table.
@@ -125,6 +126,9 @@ func (d *Daemon) applyUserConfig(cfg *config.UserConfig, byPerson bool) {
 	// Where a new worktree goes widens nothing a pane may do: a pane that can
 	// write the file can already run git worktree add itself.
 	d.SetWorktreePath(cfg.Worktree.Path)
+	// Set even when empty, so removing provider_command from the file turns
+	// the provider off on the next reload.
+	worktree.SetProviderCommand(cfg.Worktree.ProviderCommand)
 	if d.buffers != nil {
 		d.buffers.SetLimits(cfg.PasteBuffers.Resolved())
 	}
